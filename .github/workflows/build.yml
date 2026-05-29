@@ -1,0 +1,40 @@
+name: Build
+
+on:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '**.md'
+      - 'scripts/**'
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        configuration: [Release, Debug]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (${{ matrix.configuration }} | x64)
+        run: msbuild TexThumbnailProvider.sln /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /m /v:minimal /nologo
+
+      - name: Upload DLL artifact
+        if: matrix.configuration == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TexThumbnailProvider-x64
+          path: x64/Release/TexThumbnailProvider.dll
+          if-no-files-found: error
