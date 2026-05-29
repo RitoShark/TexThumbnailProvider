@@ -1,6 +1,6 @@
 # TexThumbnailProvider
 
-Windows Explorer **thumbnail handler** for League of Legends `.tex` textures..
+Windows Explorer **thumbnail handler** for League of Legends `.tex` textures.
 
 Once installed, Explorer renders real thumbnails for `.tex` files — in the file
 list, the preview pane, and "extra large icons" view — instead of a blank/generic
