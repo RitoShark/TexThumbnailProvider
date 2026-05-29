@@ -77,8 +77,8 @@ Output: `x64\Release\TexThumbnailProvider.dll`. Build and install a local copy f
 testing (same install location as the public installer, re-runnable after each
 rebuild) with:
 
-```powershell
-.\scripts\install-local.ps1 -Build
+```bat
+scripts\install-local.bat build
 ```
 
 CI builds every push ([Build workflow](.github/workflows/build.yml)); tagging
