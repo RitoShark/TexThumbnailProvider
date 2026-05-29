@@ -1,43 +1,111 @@
----
-page_type: sample
-languages:
-- cpp
-products:
-- windows-api-win32
-name: Explorer thumbnail provider
-urlFragment: recipethumbnailprovider
-description: Illustrates how to create a Thumbnail provider that extends the explorer, providing thumbnails for a particular file type.
-extendedZipContent:
-- path: LICENSE
-  target: LICENSE
----
+# TexThumbnailProvider
 
-# Explorer thumbnail provider
+Windows Explorer **thumbnail handler** for League of Legends `.tex` textures.
 
-Illustrates how to create a Thumbnail provider that extends the explorer, providing thumbnails for a particular file type.
+Once installed, Explorer renders real thumbnails for `.tex` files — in the file
+list, the preview pane, and "extra large icons" view — instead of a blank/generic
+icon. It decodes the texture directly, so no app needs to be open.
 
-**Note** that Explorer may choose not to show thumbnails even if a provider is available.
-For example, a file that has been archived to tape will not be recalled to obtain its thumbnail.
+![preview](https://img.shields.io/badge/Explorer-thumbnails-blue) ![platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey)
 
-Debugging thumbnail handlers is difficult for several reasons.
+## Supported formats
 
-1) The Windows Explorer hosts thumbnail providers in an isolated process to get robustness and improve security. Because of this it is difficult to debug your handler as you cannot set breakpoints on your code in the explorer.exe process as it is not loaded there. The isolated process is DllHost.exe and this is used for other purposes so finding the right instance of this process is difficult. 
+| `.tex` code | Format            | Notes                                    |
+|-------------|-------------------|------------------------------------------|
+| `0x0A`      | DXT1 / BC1        |                                          |
+| `0x0C`      | DXT5 / BC3        |                                          |
+| `0x0D`      | BC7               | full 8-mode software decode              |
+| `0x0E`      | BC5               | two-channel; blue reconstructed as normal-map Z |
+| `0x14`      | BGRA8             | uncompressed                             |
 
-2) Once a thumbnail is computed for a particular file it is cached and your handler won�t be called again for that item unless you invalidate the cache by updating the modification date of the file. Note that this cache works even if the files are renamed or moved.
+Mipmapped textures are handled (the largest mip is decoded for the thumbnail).
 
-Given all of these issues, the easiest way to debug your code is in a test application,
-such as the [UsingThumbnailProviders](https://github.com/microsoft/Windows-classic-samples/tree/master/Samples/Win7Samples/winui/shell/appplatform/UsingThumbnailProviders) sample.
-Once you have proven it works there, test it in the context of Explorer.
+## Install
 
-This app will take a command line parameter that names the file to get the thumbnail from and a second param that names the size to request. 
+Run in PowerShell (admin **not** required — registration is per-user):
 
-    ThumbnailProvider.exe <path to your file type> <image size>
+```powershell
+iwr -useb https://raw.githubusercontent.com/RitoShark/TexThumbnailProvider/master/scripts/install-thumbnail-handler.ps1 | iex
+```
 
-Another step you can take to improve the debugging experience
-is to disable the process isolation feature of Explorer.
-You can do this by putting the following named value on the CLSID of your handler:
+This downloads `TexThumbnailProvider.dll` from the [latest release](https://github.com/RitoShark/TexThumbnailProvider/releases/latest),
+installs it to `%LOCALAPPDATA%\RitoShark\TexThumbnailProvider`, and registers it.
 
-    HKCR\CLSID\{CLSID of Your Handler}
-        DisableProcessIsolation=REG_DWORD:1
+Pin a specific version:
 
-*** Be sure to not ship your handler with this on as customers require the security and robustness benefits of the isolated process feature ***
+```powershell
+& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/RitoShark/TexThumbnailProvider/master/scripts/install-thumbnail-handler.ps1))) -Version v1.1.0
+```
+
+### Uninstall
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/RitoShark/TexThumbnailProvider/master/scripts/uninstall-thumbnail-handler.ps1 | iex
+```
+
+> **Already-cached thumbnails not updating?** Windows caches thumbnails per file.
+> After installing, existing `.tex` thumbnails repaint only once the file's
+> modified-time changes or the cache is cleared (Disk Cleanup → *Thumbnails*).
+
+## Priority over Photoshop
+
+If you also have the [RitoTex Photoshop plugin](https://github.com/RitoShark/RitoTex-Photoshop)
+installed, Photoshop registers itself as the `.tex` thumbnail handler and would
+normally win. Windows resolves the handler by precedence:
+
+```
+ProgID(.tex)  >  SystemFileAssociations\.tex  >  .tex\ShellEx
+```
+
+Photoshop owns the `.tex` ProgID's handler (in `HKLM`), so a plain `.tex\ShellEx`
+registration never gets picked. The installer therefore also writes this handler's
+CLSID under the current `.tex` ProgID and under `SystemFileAssociations\.tex` in
+`HKCU` — which overrides `HKLM` in the merged `HKEY_CLASSES_ROOT` view — so these
+thumbnails win. Only the thumbnail subkey is touched; double-clicking a `.tex`
+still opens whatever app you have associated.
+
+## Build from source
+
+Requires Visual Studio 2022 (v143 toolset) with the *Desktop development with C++*
+workload.
+
+```powershell
+msbuild TexThumbnailProvider.sln /p:Configuration=Release /p:Platform=x64
+```
+
+Output: `x64\Release\TexThumbnailProvider.dll`. Build and install a local copy for
+testing (same install location as the public installer, re-runnable after each
+rebuild) with:
+
+```powershell
+.\scripts\install-local.ps1 -Build
+```
+
+CI builds every push ([Build workflow](.github/workflows/build.yml)); tagging
+`v*` builds and attaches the DLL to a GitHub Release ([Release workflow](.github/workflows/release.yml)).
+
+## How it works
+
+| File                        | Responsibility                                                            |
+|-----------------------------|---------------------------------------------------------------------------|
+| `Dll.cpp`                   | COM class factory + `DllRegisterServer`/`DllUnregisterServer` (incl. priority registration). |
+| `TexThumbnailProvider.cpp`  | `IThumbnailProvider` / `IInitializeWithStream`: parses the `.tex` header, decodes, builds the `HBITMAP`. |
+| `s3tc.cpp` / `s3tc.h`       | Self-contained block decoders: DXT1, DXT5, BC5, BC7. No external deps.     |
+
+The decoders are deliberately standalone (no DirectXTex) to keep the shell
+extension small and fast to load inside `DllHost.exe`. The BC7 tables and decode
+flow match the BC7 specification.
+
+## Debugging
+
+Explorer hosts thumbnail providers in an isolated `DllHost.exe` process, and
+thumbnails are cached per file, which makes debugging awkward. The easiest loop is
+to test the handler in a standalone test app (e.g. the Microsoft
+[UsingThumbnailProviders](https://github.com/microsoft/Windows-classic-samples/tree/master/Samples/Win7Samples/winui/shell/appplatform/UsingThumbnailProviders)
+sample) before testing inside Explorer. To clear the cache between runs, change the
+file's modified-time or run Disk Cleanup → *Thumbnails*.
+
+## License
+
+See [LICENSE.txt](LICENSE.txt). Originally derived from the Microsoft Windows
+classic samples thumbnail-provider recipe.

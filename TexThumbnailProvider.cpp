@@ -106,8 +106,10 @@ enum tex_format {
     tex_format_etc1 = 0x1,
     tex_format_etc2_eac = 0x2,
     tex_format_etc2 = 0x3,
-    tex_format_dxt1 = 0xA,
-    tex_format_dxt5 = 0xC,
+    tex_format_dxt1 = 0xA,   // BC1
+    tex_format_dxt5 = 0xC,   // BC3
+    tex_format_bc7 = 0xD,    // BC7
+    tex_format_bc5 = 0xE,    // BC5 (two-channel / normal maps)
     tex_format_bgra8 = 0x14
 };
 #define tex_magic "TEX"
@@ -220,9 +222,11 @@ HRESULT CreateHBitmapFromTex(IStream* pTexStream, HBITMAP* phbmp, WTS_ALPHATYPE*
         free(pixelData);
         return S_OK;
     }
-    else if (header.tex_format == tex_format_dxt5 || header.tex_format == tex_format_dxt1)
+    else if (header.tex_format == tex_format_dxt5 || header.tex_format == tex_format_dxt1 ||
+             header.tex_format == tex_format_bc7  || header.tex_format == tex_format_bc5)
     {
-        const UINT bytesPerBlock  = header.tex_format == tex_format_dxt5 ? 16 : 8;
+        // DXT1/BC1 is 8 bytes per 4x4 block; DXT5/BC3, BC7 and BC5 are 16.
+        const UINT bytesPerBlock  = (header.tex_format == tex_format_dxt1) ? 8 : 16;
         UINT dataSize;
 
         if (header.has_mipmaps) {
@@ -273,11 +277,19 @@ HRESULT CreateHBitmapFromTex(IStream* pTexStream, HBITMAP* phbmp, WTS_ALPHATYPE*
         }
 
 
-        if (header.tex_format == tex_format_dxt5) {
+        switch (header.tex_format) {
+        case tex_format_dxt5:
             BlockDecompressImageDXT5(width, height, *dxtData, *imageData);
-        }
-        else {
+            break;
+        case tex_format_bc7:
+            BlockDecompressImageBC7(width, height, *dxtData, *imageData);
+            break;
+        case tex_format_bc5:
+            BlockDecompressImageBC5(width, height, *dxtData, *imageData);
+            break;
+        default: // tex_format_dxt1
             BlockDecompressImageDXT1(width, height, *dxtData, *imageData);
+            break;
         }
 
         BITMAPINFO bmi = {};

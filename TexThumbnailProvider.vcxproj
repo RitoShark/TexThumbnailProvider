@@ -190,7 +190,6 @@
     <None Include=".gitignore" />
     <None Include="README.md" />
     <None Include="TexThumbnailProvider.def" />
-    <None Include="TexThumbnailProvider.vcproj" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Dll.cpp" />

@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (Release | x64)
+        run: msbuild TexThumbnailProvider.sln /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
+
+      - name: Stage release asset
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item x64/Release/TexThumbnailProvider.dll dist/TexThumbnailProvider.dll
+          Get-FileHash dist/TexThumbnailProvider.dll -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  TexThumbnailProvider.dll" } |
+            Set-Content dist/TexThumbnailProvider.dll.sha256 -Encoding ascii
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/TexThumbnailProvider.dll
+            dist/TexThumbnailProvider.dll.sha256
+          body: |
+            Windows Explorer thumbnail handler for League of Legends `.tex` textures.
+
+            ### Install (PowerShell)
+            ```powershell
+            iwr -useb https://raw.githubusercontent.com/RitoShark/TexThumbnailProvider/master/scripts/install-thumbnail-handler.ps1 | iex
+            ```
+
+            The installer downloads `TexThumbnailProvider.dll` (attached below) and registers it per-user — no admin required.
+            To uninstall:
+            ```powershell
+            iwr -useb https://raw.githubusercontent.com/RitoShark/TexThumbnailProvider/master/scripts/uninstall-thumbnail-handler.ps1 | iex
+            ```
