@@ -9,19 +9,9 @@
 #pragma comment(lib, "Crypt32.lib")
 
 #include <memory> // Smart Pointers >w<
+#include <vector>
 #include "s3tc.h"
 
-
-#if defined(_MSC_VER)
-#include <intrin.h> // _BitScanReverse64
-static inline unsigned int LEADING_ZEROS(unsigned int x) {
-    unsigned long idx;
-    if (_BitScanReverse64(&idx, x))
-        return 31 - idx;
-    else
-        return 32;
-}
-#endif
 
 class CTexThumbProvider : public IInitializeWithStream,
                              public IThumbnailProvider
@@ -123,12 +113,6 @@ typedef struct {
 } TEX_HEADER;
 
 
-void swapUInt8(uint8_t* a, uint8_t* b) {
-    uint8_t temp = *a;
-    *a = *b;
-    *b = temp;
-}
-
 int get_num_mipmaps(int width, int height) {
     int num = 0;
     while (width > 1 || height > 1) {
@@ -138,6 +122,72 @@ int get_num_mipmaps(int width, int height) {
     }
     return num;
 }
+
+struct MallocDeleter {
+    void operator()(void* p) const { free(p); }
+};
+
+template <typename T>
+using malloc_ptr = std::unique_ptr<T, MallocDeleter>;
+
+void ComputeFitDims(UINT w, UINT h, UINT maxDim, UINT* dw, UINT* dh)
+{
+    if (w <= maxDim && h <= maxDim)
+    {
+        *dw = w;
+        *dh = h;
+        return;
+    }
+
+    if (w >= h)
+    {
+        *dw = maxDim;
+        *dh = (UINT)((unsigned long long)h * maxDim / w);
+    }
+    else
+    {
+        *dh = maxDim;
+        *dw = (UINT)((unsigned long long)w * maxDim / h);
+    }
+    if (*dw == 0) *dw = 1;
+    if (*dh == 0) *dh = 1;
+}
+
+struct BoxDownsampler
+{
+    UINT srcW, srcH, dstW, dstH;
+    std::vector<uint32_t> b, g, r, a, cnt;
+
+    BoxDownsampler(UINT sw, UINT sh, UINT dw, UINT dh)
+        : srcW(sw), srcH(sh), dstW(dw), dstH(dh),
+          b((size_t)dw * dh, 0), g((size_t)dw * dh, 0), r((size_t)dw * dh, 0),
+          a((size_t)dw * dh, 0), cnt((size_t)dw * dh, 0)
+    {
+    }
+
+    inline void Add(UINT sx, UINT sy, uint8_t cb, uint8_t cg, uint8_t cr, uint8_t ca)
+    {
+        UINT dx = (UINT)((unsigned long long)sx * dstW / srcW);
+        UINT dy = (UINT)((unsigned long long)sy * dstH / srcH);
+        size_t idx = (size_t)dy * dstW + dx;
+        b[idx] += cb; g[idx] += cg; r[idx] += cr; a[idx] += ca;
+        cnt[idx]++;
+    }
+
+    void WriteArgb(void* bits) const
+    {
+        unsigned long* px = (unsigned long*)bits;
+        size_t n = (size_t)dstW * dstH;
+        for (size_t i = 0; i < n; ++i)
+        {
+            uint32_t c = cnt[i] ? cnt[i] : 1;
+            px[i] = ((unsigned long)(a[i] / c) << 24) |
+                    ((unsigned long)(r[i] / c) << 16) |
+                    ((unsigned long)(g[i] / c) << 8) |
+                    ((unsigned long)(b[i] / c));
+        }
+    }
+};
 
 HRESULT CreateHBitmapFromTex(IStream* pTexStream, HBITMAP* phbmp, WTS_ALPHATYPE* pdwAlpha)
 {
@@ -156,6 +206,9 @@ HRESULT CreateHBitmapFromTex(IStream* pTexStream, HBITMAP* phbmp, WTS_ALPHATYPE*
 
     UINT width = header.image_width;
     UINT height = header.image_height;
+
+    if (width == 0 || height == 0)
+        return E_INVALIDARG;
 
     if (header.tex_format == tex_format_bgra8)
     {
@@ -184,23 +237,13 @@ HRESULT CreateHBitmapFromTex(IStream* pTexStream, HBITMAP* phbmp, WTS_ALPHATYPE*
             }
         }
 
-        const UINT imageSize = stride * height;
-
-        BYTE* pixelData = (BYTE*)malloc(imageSize);
-        if (!pixelData)
-            return E_OUTOFMEMORY;
-
-        hr = pTexStream->Read(pixelData, imageSize, &bytesRead);
-        if (FAILED(hr) || bytesRead != imageSize)
-        {
-            free(pixelData);
-            return E_FAIL;
-        }
+        UINT dstW, dstH;
+        ComputeFitDims(width, height, 1024, &dstW, &dstH);
 
         BITMAPINFO bmi = {};
         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = width;
-        bmi.bmiHeader.biHeight = -((LONG)height);
+        bmi.bmiHeader.biWidth = dstW;
+        bmi.bmiHeader.biHeight = -((LONG)dstH);
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB;
@@ -208,16 +251,40 @@ HRESULT CreateHBitmapFromTex(IStream* pTexStream, HBITMAP* phbmp, WTS_ALPHATYPE*
         void* bits;
         HBITMAP hBitmap = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
         if (!hBitmap)
-        {
-            free(pixelData);
             return E_OUTOFMEMORY;
+
+        if (dstW == width && dstH == height)
+        {
+            const UINT imageSize = stride * height;
+            hr = pTexStream->Read(bits, imageSize, &bytesRead);
+            if (FAILED(hr) || bytesRead != imageSize)
+            {
+                DeleteObject(hBitmap);
+                return E_FAIL;
+            }
+        }
+        else
+        {
+            BoxDownsampler ds(width, height, dstW, dstH);
+            std::vector<uint8_t> row((size_t)width * 4);
+            for (UINT y = 0; y < height; ++y)
+            {
+                hr = pTexStream->Read(row.data(), (ULONG)row.size(), &bytesRead);
+                if (FAILED(hr) || bytesRead != row.size())
+                {
+                    DeleteObject(hBitmap);
+                    return E_FAIL;
+                }
+                const uint8_t* p = row.data();
+                for (UINT x = 0; x < width; ++x, p += 4)
+                    ds.Add(x, y, p[0], p[1], p[2], p[3]);
+            }
+            ds.WriteArgb(bits);
         }
 
-        memcpy(bits, pixelData, imageSize);
         *phbmp = hBitmap;
         *pdwAlpha = WTSAT_ARGB;
 
-        free(pixelData);
         return S_OK;
     }
     else if (header.tex_format == tex_format_dxt5 || header.tex_format == tex_format_dxt1)
@@ -254,73 +321,96 @@ HRESULT CreateHBitmapFromTex(IStream* pTexStream, HBITMAP* phbmp, WTS_ALPHATYPE*
         const UINT blockHeight = (height + 3) / 4;
         dataSize = blockWidth * blockHeight * bytesPerBlock ;
 
-        UINT stride = width * 4;
-
-        auto dxtData = std::make_unique<uint8_t*>((uint8_t *) malloc(dataSize));
+        malloc_ptr<uint8_t> dxtData((uint8_t *) malloc(dataSize));
         if (!dxtData)
             return E_OUTOFMEMORY;
 
-        hr = pTexStream->Read(*dxtData, dataSize, &bytesRead);
+        hr = pTexStream->Read(dxtData.get(), dataSize, &bytesRead);
         if (FAILED(hr) || bytesRead != dataSize)
         {
             return E_FAIL;
         }
 
-        auto imageData = std::make_unique<unsigned long*>((unsigned long*) malloc(stride * height));
-        if (!imageData)
-        {
-            return E_OUTOFMEMORY;
-        }
-
-
-        if (header.tex_format == tex_format_dxt5) {
-            BlockDecompressImageDXT5(width, height, *dxtData, *imageData);
-        }
-        else {
-            BlockDecompressImageDXT1(width, height, *dxtData, *imageData);
-        }
+        UINT dstW, dstH;
+        ComputeFitDims(width, height, 1024, &dstW, &dstH);
 
         BITMAPINFO bmi = {};
         bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-        bmi.bmiHeader.biWidth = width;
-        bmi.bmiHeader.biHeight = -((LONG)height); // top-down
+        bmi.bmiHeader.biWidth = dstW;
+        bmi.bmiHeader.biHeight = -((LONG)dstH); // top-down
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB;
 
         void* bits;
-        
-        auto finalImage = std::make_unique<unsigned long*>((unsigned long*) malloc(stride * height));
-        if (!finalImage)
-        {
-            return E_OUTOFMEMORY;
-        }
-        
-        // RGBA -> ARGB
-        for (size_t i = 0; i < width * height; ++i)
-        {
-            unsigned long rgba = (*imageData)[i];
-            unsigned char r = (rgba >> 24) & 0xFF;
-            unsigned char g = (rgba >> 16) & 0xFF;
-            unsigned char b = (rgba >> 8) & 0xFF;
-            unsigned char a = rgba & 0xFF;
-
-            (*finalImage)[i] = (
-                (unsigned long)a << 24) |
-                ((unsigned long)r << 16) |
-                ((unsigned long)g << 8) |
-                ((unsigned long)b);
-        }
-        
-        imageData = std::move(finalImage);
-
         HBITMAP hBitmap = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
         if (!hBitmap)
         {
             return E_OUTOFMEMORY;
         }
 
-        memcpy(bits, *imageData, stride * height);
+        if (dstW == width && dstH == height)
+        {
+            unsigned long* pixels = (unsigned long*) bits;
+
+            if (header.tex_format == tex_format_dxt5) {
+                BlockDecompressImageDXT5(width, height, dxtData.get(), pixels);
+            }
+            else {
+                BlockDecompressImageDXT1(width, height, dxtData.get(), pixels);
+            }
+
+            // RGBA -> ARGB
+            for (size_t i = 0; i < width * height; ++i)
+            {
+                unsigned long rgba = pixels[i];
+                unsigned char r = (rgba >> 24) & 0xFF;
+                unsigned char g = (rgba >> 16) & 0xFF;
+                unsigned char b = (rgba >> 8) & 0xFF;
+                unsigned char a = rgba & 0xFF;
+
+                pixels[i] = (
+                    (unsigned long)a << 24) |
+                    ((unsigned long)r << 16) |
+                    ((unsigned long)g << 8) |
+                    ((unsigned long)b);
+            }
+        }
+        else
+        {
+            BoxDownsampler ds(width, height, dstW, dstH);
+            unsigned long block[16];
+            for (UINT by = 0; by < blockHeight; ++by)
+            {
+                for (UINT bx = 0; bx < blockWidth; ++bx)
+                {
+                    const uint8_t* src = dxtData.get() + ((size_t)by * blockWidth + bx) * bytesPerBlock;
+                    if (header.tex_format == tex_format_dxt5)
+                        DecompressBlockDXT5(0, 0, 4, src, block);
+                    else
+                        DecompressBlockDXT1(0, 0, 4, src, block);
+
+                    for (UINT j = 0; j < 4; ++j)
+                    {
+                        UINT sy = by * 4 + j;
+                        if (sy >= height) continue;
+                        for (UINT i = 0; i < 4; ++i)
+                        {
+                            UINT sx = bx * 4 + i;
+                            if (sx >= width) continue;
+                            unsigned long rgba = block[j * 4 + i];
+                            ds.Add(sx, sy,
+                                   (uint8_t)((rgba >> 8) & 0xFF),
+                                   (uint8_t)((rgba >> 16) & 0xFF),
+                                   (uint8_t)((rgba >> 24) & 0xFF),
+                                   (uint8_t)(rgba & 0xFF));
+                        }
+                    }
+                }
+            }
+            ds.WriteArgb(bits);
+        }
+
         *phbmp = hBitmap;
         *pdwAlpha = WTSAT_ARGB;
 
